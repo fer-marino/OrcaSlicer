@@ -17,15 +17,21 @@ server or middleware -- the "middleware" is just this file.
 
   page   --orca.postMessage({command:'chat', text})-->          plugin.on_message()
   page   --orca.postMessage({command:'save_settings', ...})-->      "
+  page   --orca.postMessage({command:'apply'})-->                   "
   page   --orca.postMessage({command:'export'})-->                  "
-  plugin --panel.post({command:'settings'|'message'|'suggestions'|'busy', ...})--> page
+  plugin --panel.post({command:'settings'|'message'|'suggestions'|'busy'|'applied'|'exported', ...})--> page
 
-Known limitation (as of this OrcaSlicer build): `orca.host` exposes presets and
-model config as READ-ONLY -- there is no binding to write a config value back.
-So "Apply" does not poke live settings; it writes a plain `key = value` file
-into this plugin's storage folder that the user imports via the existing
-File > Import Config flow. Swap `export_suggestions()` for a direct write once
-a setter is added to the preset bindings (PluginHostPresets.cpp).
+"Apply suggestions" calls `orca.host.preset_bundle().apply_config({key: value, ...})`,
+which requires the PluginHostPresets.cpp write bindings (see PluginBindingUtils.hpp's
+run_on_ui_blocking). It shows its own native Yes/No confirmation before touching
+anything -- this is a plain pybind11 call, not a CPython audit event, so it is
+not gated by PluginAuditManager the way filesystem/network access is. It marks
+the affected presets dirty but does not save them. Declining, an unknown key, or
+a value that fails to parse raises, and nothing is applied.
+
+On an OrcaSlicer build without that binding (hasattr check), "Export .ini instead"
+writes a plain `key = value` file into this plugin's storage folder that the user
+imports via the existing File > Import Config flow.
 
 The LLM call happens on a worker thread (on_message runs on the UI thread) and
 results come back via panel.post(), same pattern as the Inspector plugin's
@@ -206,6 +212,8 @@ PAGE = r"""
   footer { flex: none; display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid var(--orca-border); }
   footer input { flex: 1; }
   .warn { color: #b8860b; font-size: 12px; }
+  .actions { display: flex; gap: 6px; padding: 0 10px 10px; }
+  .actions button.quiet { background: transparent; color: var(--orca-fg); border-color: var(--orca-border); }
 </style>
 
 <header>
@@ -221,10 +229,13 @@ PAGE = r"""
   </div>
 </header>
 <div id="log"></div>
+<div class="actions" id="suggestion-actions" style="display:none">
+  <button id="apply">Apply suggestions</button>
+  <button id="export" class="quiet">Export .ini instead</button>
+</div>
 <footer>
   <input id="input" placeholder="Ask about this project's settings...">
   <button id="send">Send</button>
-  <button id="export" class="quiet" style="display:none">Export suggestions</button>
 </footer>
 
 <script>
@@ -261,7 +272,7 @@ PAGE = r"""
     });
     log.scrollTop = log.scrollHeight;
     lastSuggestions = data.suggestions;
-    document.getElementById("export").style.display = lastSuggestions.length ? "" : "none";
+    document.getElementById("suggestion-actions").style.display = lastSuggestions.length ? "flex" : "none";
   }
 
   orca.onMessage(function (message) {
@@ -276,6 +287,11 @@ PAGE = r"""
       renderSuggestions(message);
     } else if (message.command === "busy") {
       document.getElementById("send").disabled = !!message.value;
+      document.getElementById("apply").disabled = !!message.value;
+    } else if (message.command === "applied") {
+      addMessage("assistant", "Applied: " + message.keys.join(", ") +
+        ". The affected presets are now marked modified -- save them if you want to keep the change.");
+      document.getElementById("suggestion-actions").style.display = "none";
     } else if (message.command === "exported") {
       addMessage("assistant", "Wrote " + message.path + " -- import it via File > Import Config.");
     }
@@ -304,6 +320,9 @@ PAGE = r"""
   });
   document.getElementById("input").addEventListener("keydown", function (e) {
     if (e.key === "Enter") document.getElementById("send").click();
+  });
+  document.getElementById("apply").addEventListener("click", function () {
+    orca.postMessage({ command: "apply" });
   });
   document.getElementById("export").addEventListener("click", function () {
     orca.postMessage({ command: "export" });
@@ -356,6 +375,8 @@ class AiAssistant(orca.script.ScriptPluginCapabilityBase):
             save_settings(self.settings)
         elif command == "chat":
             threading.Thread(target=self.run_chat, args=(message.get("text", ""),), daemon=True).start()
+        elif command == "apply":
+            threading.Thread(target=self.run_apply, daemon=True).start()
         elif command == "export":
             threading.Thread(target=self.run_export, daemon=True).start()
 
@@ -373,6 +394,21 @@ class AiAssistant(orca.script.ScriptPluginCapabilityBase):
             self.panel.post({"command": "message", "role": "error", "text": f"Error: {exc}"})
         finally:
             self.panel.post({"command": "busy", "value": False})
+
+    def run_apply(self):
+        suggestions = getattr(self, "_last_suggestions", [])
+        if not suggestions:
+            return
+        bundle = orca.host.preset_bundle()
+        if not hasattr(bundle, "apply_config"):
+            self.panel.post({"command": "message", "role": "error",
+                             "text": "This OrcaSlicer build has no write API yet -- use Export instead."})
+            return
+        try:
+            applied = bundle.apply_config({item["key"]: item["value"] for item in suggestions})
+            self.panel.post({"command": "applied", "keys": applied})
+        except RuntimeError as exc:
+            self.panel.post({"command": "message", "role": "error", "text": str(exc)})
 
     def run_export(self):
         suggestions = getattr(self, "_last_suggestions", [])
