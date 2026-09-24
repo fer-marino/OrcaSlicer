@@ -7,13 +7,14 @@
 # author = "OrcaSlicer"
 # version = "0.1.0"
 # ///
-"""AI Assistant -- a chat panel that asks an external LLM to review the current
+"""AI Assistant -- a chat window that asks an external LLM to review the current
 project and suggest OrcaSlicer settings changes.
 
 Everything runs in-process: context comes straight from `orca.host` (read-only),
-the HTTP call goes out from this plugin's own Python code, and the panel is an
-`orca.host.ui` dock panel, same as the Dock Panel Demo. There is no separate
-server or middleware -- the "middleware" is just this file.
+the HTTP call goes out from this plugin's own Python code, and the UI is a plain
+`orca.host.ui.create_window()` window (non-modal), same as the Inspector plugin's
+main window -- this build has no docked-panel API, only floating windows. There
+is no separate server or middleware -- the "middleware" is just this file.
 
   page   --orca.postMessage({command:'chat', text})-->          plugin.on_message()
   page   --orca.postMessage({command:'save_settings', ...})-->      "
@@ -349,17 +350,19 @@ class AiAssistant(orca.script.ScriptPluginCapabilityBase):
 
     def execute(self):
         self.settings = load_settings()
+        # Capability objects are instantiated once per plugin load, so a second Run lands on
+        # the same instance -- close any previous window first (create_window has no
+        # show()/focus(), so bringing an existing window forward isn't possible; matches the
+        # Inspector plugin's own execute() pattern).
         if self.panel is not None and self.panel.is_open():
-            self.panel.show()
-            return orca.ExecutionResult.success("AI Assistant is already open.")
-        self.panel = orca.host.ui.create_dock_panel(
+            self.panel.close()
+        self.panel = orca.host.ui.create_window(
             html=PAGE,
             title="AI Assistant",
             width=360,
             height=560,
             on_message=self.on_message,
             on_close=self.on_close,
-            dock="right",
         )
         return orca.ExecutionResult.success("AI Assistant opened.")
 
