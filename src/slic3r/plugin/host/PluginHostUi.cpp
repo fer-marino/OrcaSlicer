@@ -3,6 +3,7 @@
 #include "slic3r/plugin/PluginAuditManager.hpp"
 #include "slic3r/plugin/PythonInterpreter.hpp" // PythonGILState
 #include "slic3r/plugin/PluginFsUtils.hpp"   // json_to_py / py_to_json
+#include "slic3r/plugin/PluginBindingUtils.hpp" // run_on_ui_blocking
 
 #include <slic3r/GUI/GUI_App.hpp>
 #include <slic3r/GUI/MainFrame.hpp>
@@ -71,17 +72,38 @@ CallablePtr make_holder(py::object obj)
     return std::make_shared<GilSafeCallable>(std::move(obj));
 }
 
+// RAII-open a ScopedPluginAuditContext for `plugin_key`/`capability_name` in the caller's own
+// scope, or do nothing when plugin_key is empty. Mirrors ORCA_PY_AUDIT_SCOPE() in
+// PyPluginTrampoline.hpp -- including being a macro rather than a function returning the
+// optional by value, because ScopedPluginAuditContext has a deleted copy constructor and (being
+// destructor-owning) no implicit move constructor either, so returning one by value does not
+// compile even when the local would be elided in practice.
+//
+// A stored callback (on_message/on_submit/on_close/on_click) fires later, from a wx event on the
+// UI thread, well after the trampoline call that created it has returned and torn down its own
+// scope -- so without this, PluginAuditManager::current_plugin() reads empty here and the audit
+// hook bypasses every fs/network/process permission check for whatever the callback does (see
+// audit_hook's "no plugin context" early-out in PluginAuditManager.cpp). Capturing the creating
+// call's plugin/capability identity up front and re-opening it for each later invocation closes
+// that gap. Declares a local `_orca_ui_audit_scope`.
+#define ORCA_UI_AUDIT_SCOPE(plugin_key, capability_name)                        \
+    std::optional<::Slic3r::ScopedPluginAuditContext> _orca_ui_audit_scope;     \
+    if (!(plugin_key).empty())                                                 \
+    _orca_ui_audit_scope.emplace((plugin_key), (capability_name))
+
 // Adapt a Python callable to a GUI message handler that acquires the GIL and
 // swallows/logs exceptions (a raising handler must not escape into wx events).
-GUI::PluginWebDialog::MessageHandler make_message_adapter(py::object on_message)
+GUI::PluginWebDialog::MessageHandler make_message_adapter(py::object on_message, std::string plugin_key,
+                                                          std::string capability_name)
 {
     CallablePtr holder = make_holder(std::move(on_message));
     if (!holder)
         return nullptr;
-    return [holder](const json& data) {
+    return [holder, plugin_key = std::move(plugin_key), capability_name = std::move(capability_name)](const json& data) {
         PythonGILState gil;
         if (!gil)
             return;
+        ORCA_UI_AUDIT_SCOPE(plugin_key, capability_name);
         try {
             holder->fn(json_to_py(data));
         } catch (py::error_already_set& e) {
@@ -91,15 +113,17 @@ GUI::PluginWebDialog::MessageHandler make_message_adapter(py::object on_message)
     };
 }
 
-GUI::PluginWebDialog::SubmitHandler make_submit_adapter(py::object on_submit)
+GUI::PluginWebDialog::SubmitHandler make_submit_adapter(py::object on_submit, std::string plugin_key,
+                                                        std::string capability_name)
 {
     CallablePtr holder = make_holder(std::move(on_submit));
     if (!holder)
         return nullptr;
-    return [holder](const json& data) {
+    return [holder, plugin_key = std::move(plugin_key), capability_name = std::move(capability_name)](const json& data) {
         PythonGILState gil;
         if (!gil)
             return;
+        ORCA_UI_AUDIT_SCOPE(plugin_key, capability_name);
         try {
             holder->fn(json_to_py(data));
         } catch (py::error_already_set& e) {
@@ -203,41 +227,8 @@ private:
     int                                  m_next_id{1};
 };
 
-// --------------------------------------------------------------------------
-// Run a (pure C++/wx) callable on the main/UI thread, blocking the caller until
-// it completes, with the GIL released across the wait. If already on the main
-// thread, run inline (also with the GIL released so other Python threads run).
-// --------------------------------------------------------------------------
-template<typename Fn>
-auto run_on_ui_blocking(Fn&& fn) -> std::invoke_result_t<Fn&>
-{
-    using R = std::invoke_result_t<Fn&>;
-    if (wxTheApp == nullptr)
-        throw std::runtime_error("OrcaSlicer application is not initialized");
-
-    if (wxIsMainThread()) {
-        py::gil_scoped_release nogil;
-        return fn();
-    }
-
-    std::promise<R> prom;
-    std::future<R>  fut = prom.get_future();
-
-    py::gil_scoped_release nogil;
-    GUI::wxGetApp().CallAfter([&prom, &fn]() {
-        try {
-            if constexpr (std::is_void_v<R>) {
-                fn();
-                prom.set_value();
-            } else {
-                prom.set_value(fn());
-            }
-        } catch (...) {
-            prom.set_exception(std::current_exception());
-        }
-    });
-    return fut.get();
-}
+// run_on_ui_blocking now lives in PluginBindingUtils.hpp, shared with the
+// preset-writing bindings in PluginHostPresets.cpp.
 
 wxWindow* ui_parent()
 {
@@ -308,10 +299,11 @@ struct UiProgressHandle
 py::object ui_create_window(const std::string& html, const std::string& title, int width, int height,
                             py::object on_message, py::object on_close, long style, py::object on_submit)
 {
-    auto              msg_adapter    = make_message_adapter(std::move(on_message));
-    auto              submit_adapter = make_submit_adapter(std::move(on_submit));
-    CallablePtr       close_holder   = make_holder(std::move(on_close));
     const std::string plugin_key     = PluginAuditManager::instance().current_plugin();
+    const std::string capability_name = PluginAuditManager::instance().current_capability();
+    auto              msg_adapter    = make_message_adapter(std::move(on_message), plugin_key, capability_name);
+    auto              submit_adapter = make_submit_adapter(std::move(on_submit), plugin_key, capability_name);
+    CallablePtr       close_holder   = make_holder(std::move(on_close));
     const int         w              = width > 0 ? width : 820;
     const int         h              = height > 0 ? height : 600;
 
@@ -342,7 +334,7 @@ py::object ui_create_window(const std::string& html, const std::string& title, i
     const int new_id = UiRegistry::instance().reserve_id();
     UiRegistry::instance().bind(new_id, nullptr, plugin_key);
 
-    GUI::wxGetApp().CallAfter([new_id, plugin_key, html, title, w, h,
+    GUI::wxGetApp().CallAfter([new_id, plugin_key, capability_name, html, title, w, h,
                                msg_adapter = std::move(msg_adapter),
                                submit_adapter = std::move(submit_adapter),
                                close_holder = std::move(close_holder), modal]() mutable {
@@ -354,10 +346,11 @@ py::object ui_create_window(const std::string& html, const std::string& title, i
         // teardown), while the dialog is alive. Empty if the plugin passed None.
         GUI::PluginWebDialog::CloseHandler on_close;
         if (close_holder) {
-            on_close = [close_holder]() {
+            on_close = [close_holder, plugin_key, capability_name]() {
                 PythonGILState gil;
                 if (!gil)
                     return;
+                ORCA_UI_AUDIT_SCOPE(plugin_key, capability_name);
                 try {
                     close_holder->fn();
                 } catch (py::error_already_set& e) {
@@ -480,20 +473,22 @@ void progress_close(int id)
 void plater_notification(NotificationManager::NotificationLevel notification_level, const std::string& text,
                          const std::string& hypertext, py::object on_click)
 {
-    const std::string plugin_key = PluginAuditManager::instance().current_plugin();
+    const std::string plugin_key      = PluginAuditManager::instance().current_plugin();
+    const std::string capability_name = PluginAuditManager::instance().current_capability();
     CallablePtr        holder    = make_holder(std::move(on_click));
     if (holder)
         UiRegistry::instance().bind_callback(holder, plugin_key);
 
     std::function<bool(wxEvtHandler*)> callback;
     if (holder) {
-        callback = [holder](wxEvtHandler*) -> bool {
+        callback = [holder, plugin_key, capability_name](wxEvtHandler*) -> bool {
             if (!holder->active.load(std::memory_order_acquire))
                 return false;
 
             PythonGILState gil;
             if (!gil)
                 return false;
+            ORCA_UI_AUDIT_SCOPE(plugin_key, capability_name);
             try {
                 py::object result = holder->fn();
                 return result.is_none() || result.cast<bool>();

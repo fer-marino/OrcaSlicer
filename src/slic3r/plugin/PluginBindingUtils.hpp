@@ -3,7 +3,13 @@
 #include <pybind11/numpy.h>
 #include "libslic3r/Config.hpp"   // ConfigBase
 #include "libslic3r/Point.hpp"    // Point/Point3 packing asserts, Vec3d, Transform3d
+
+#include <wx/app.h>
+
+#include <future>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -85,6 +91,45 @@ inline pybind11::object config_value_or_none(const ConfigBase& config, const std
 inline pybind11::tuple vec3_to_tuple(const Vec3d& v)
 {
     return pybind11::make_tuple(v.x(), v.y(), v.z());
+}
+
+// Run a (pure C++/wx) callable on the main/UI thread, blocking the caller until
+// it completes, with the GIL released across the wait. If already on the main
+// thread, run inline (also with the GIL released so other Python threads run).
+//
+// `fn` must not touch any Python object: it may run on the UI thread with the
+// GIL not held, so extract plain C++ values from Python arguments before
+// calling this, exactly as the orca.host.ui window constructors do.
+template<typename Fn>
+auto run_on_ui_blocking(Fn&& fn) -> std::invoke_result_t<Fn&>
+{
+    namespace py = pybind11;
+    using R = std::invoke_result_t<Fn&>;
+    if (wxTheApp == nullptr)
+        throw std::runtime_error("OrcaSlicer application is not initialized");
+
+    if (wxIsMainThread()) {
+        py::gil_scoped_release nogil;
+        return fn();
+    }
+
+    std::promise<R> prom;
+    std::future<R>  fut = prom.get_future();
+
+    py::gil_scoped_release nogil;
+    wxTheApp->CallAfter([&prom, &fn]() {
+        try {
+            if constexpr (std::is_void_v<R>) {
+                fn();
+                prom.set_value();
+            } else {
+                prom.set_value(fn());
+            }
+        } catch (...) {
+            prom.set_exception(std::current_exception());
+        }
+    });
+    return fut.get();
 }
 
 // 4x4 row-major float64 copy of an affine transform. Eigen stores column-major,

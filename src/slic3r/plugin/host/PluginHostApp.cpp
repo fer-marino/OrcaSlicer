@@ -1,4 +1,5 @@
 #include "PluginHostBindings.hpp"
+#include "slic3r/plugin/PluginBindingUtils.hpp"
 
 #include <libslic3r/Model.hpp>
 #include <libslic3r/PresetBundle.hpp>
@@ -49,7 +50,20 @@ void host_bindings::register_app(py::module_& host)
         .def("model", static_cast<Model& (GUI::Plater::*)()>(&GUI::Plater::model), py::return_value_policy::reference_internal)
         .def("is_project_dirty", &GUI::Plater::is_project_dirty)
         .def("is_presets_dirty", &GUI::Plater::is_presets_dirty)
-        .def("inside_snapshot_capture", &GUI::Plater::inside_snapshot_capture);
+        .def("inside_snapshot_capture", &GUI::Plater::inside_snapshot_capture)
+        .def(
+            "sync_ams_filaments",
+            [](GUI::Plater&) {
+                // Same action as the sidebar's own sync button (Sidebar::sync_ams_list, bound to
+                // the "Synchronize Filament List from AMS" native command). Safe to call with no
+                // printer connected or paired: it shows the app's own "printer not connected"
+                // prompt via Plater::pop_warning_and_go_to_device_page and returns, rather than
+                // raising -- so a plugin can offer this unconditionally.
+                run_on_ui_blocking([]() { current_plater()->sidebar().sync_ams_list(); });
+            },
+            "Pull filament info from the connected printer's AMS into the project. Runs on the "
+            "UI thread (marshaled automatically). With no printer connected, shows the app's own "
+            "\"not connected\" prompt instead of raising.");
 
     host.def("plater", &current_plater, py::return_value_policy::reference);
     host.def("model", []() -> Model& {

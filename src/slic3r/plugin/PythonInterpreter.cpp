@@ -310,6 +310,60 @@ del _OrcaTeeStderr
     }
 }
 
+// A plugin callback (on_message, on_submit, ...) runs with a thread_local audit identity opened
+// for it (see ORCA_UI_AUDIT_SCOPE / ORCA_PY_AUDIT_SCOPE), but a threading.Thread it spawns from
+// there runs on a brand new OS thread whose own copy of that thread_local starts empty. Without
+// this, code running on such a thread is invisible to PluginAuditManager: the audit hook's
+// "no plugin context" early-out silently waives every fs/network/process permission check for
+// it (PluginAuditManager.cpp, audit_hook), and host APIs that read the calling plugin's identity
+// (e.g. PresetBundle.apply_config's confirmation dialog) fall back to an anonymous "A plugin".
+//
+// Patches threading.Thread once, process-wide, to close that gap: start() captures the starting
+// thread's current (plugin_key, capability_name) via orca.host.plugin._capture_audit_identity(),
+// and run() re-opens it as a ScopedPluginAuditContext (via the orca.host.plugin._AuditScope
+// wrapper) for the duration of the thread's body. A thread started outside any plugin callback
+// captures ("", "") and the scope is skipped, matching the pre-existing unaudited behavior.
+void install_thread_audit_propagation()
+{
+    static const char* const script = R"PATCH_SCRIPT(
+import threading as _orca_threading
+import orca as _orca
+_orca_plugin_host = _orca.host.plugin
+
+if not getattr(_orca_threading.Thread, "_orca_audit_patched", False):
+    _orca_orig_thread_start = _orca_threading.Thread.start
+    _orca_orig_thread_run = _orca_threading.Thread.run
+
+    def _orca_thread_start(self, *args, **kwargs):
+        self._orca_audit_identity = _orca_plugin_host._capture_audit_identity()
+        return _orca_orig_thread_start(self, *args, **kwargs)
+
+    def _orca_thread_run(self, *args, **kwargs):
+        identity = getattr(self, "_orca_audit_identity", None)
+        if identity and identity[0]:
+            with _orca_plugin_host._AuditScope(identity[0], identity[1]):
+                return _orca_orig_thread_run(self, *args, **kwargs)
+        return _orca_orig_thread_run(self, *args, **kwargs)
+
+    _orca_threading.Thread.start = _orca_thread_start
+    _orca_threading.Thread.run = _orca_thread_run
+    _orca_threading.Thread._orca_audit_patched = True
+
+# _orca_plugin_host stays: _orca_thread_start/_orca_thread_run close over it as a free
+# variable resolved from this module's globals at CALL time, which is long after this
+# script returns (they're invoked whenever a plugin later does threading.Thread(...).start()).
+# Deleting it here would leave those closures resolving a name that's gone by then.
+del _orca_threading, _orca
+)PATCH_SCRIPT";
+
+    if (PyRun_SimpleString(script) != 0) {
+        PyErr_Clear();
+        BOOST_LOG_TRIVIAL(warning) << "Failed to install threading.Thread audit identity propagation";
+    } else {
+        BOOST_LOG_TRIVIAL(info) << "threading.Thread audit identity propagation installed";
+    }
+}
+
 void log_and_restore_python_stdio()
 {
     PyObject* sys = PyImport_ImportModule("sys");
@@ -633,6 +687,10 @@ bool PythonInterpreter::initialize()
         // Persist Python stderr (plugin tracebacks, including uncaught
         // background-thread exceptions) to <data_dir>/log/python_*.log.
         install_python_stderr_redirect();
+
+        // Give a plugin-spawned threading.Thread the same audit identity as the callback that
+        // spawned it, so the audit hook and host APIs still recognize it as coming from a plugin.
+        install_thread_audit_propagation();
 
         // Release the GIL so other threads can acquire it via PyGILState_Ensure.
         // Without this, calls from background threads will block trying to acquire the GIL.

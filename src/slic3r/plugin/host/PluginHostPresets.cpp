@@ -1,12 +1,24 @@
 #include "PluginHostBindings.hpp"
 #include "slic3r/plugin/PluginBindingUtils.hpp"
+#include "slic3r/plugin/PluginAuditManager.hpp"
+#include "slic3r/plugin/PluginManager.hpp"
 
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/PresetBundle.hpp>
+#include <libslic3r/PrintConfig.hpp>
+
+#include <slic3r/GUI/GUI_App.hpp>
+#include <slic3r/GUI/I18N.hpp>
+#include <slic3r/GUI/MainFrame.hpp>
 
 #include <pybind11/stl.h>
 
+#include <wx/msgdlg.h>
+#include <wx/string.h>
+
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace py = pybind11;
@@ -30,6 +42,71 @@ py::list current_filament_presets(PresetBundle& bundle)
 PresetCollection& printer_presets(PresetBundle& bundle)
 {
     return static_cast<PresetCollection&>(bundle.printers);
+}
+
+// Apply a {config_key: value_string} diff to the live print/filament/printer
+// presets and refresh the GUI to match, exactly like importing a config file
+// does (MainFrame::load_config fans the diff out to whichever tabs recognize
+// each key, marks them dirty, and reloads the Plater).
+//
+// This is a plain pybind11 call, not a recognized CPython audit event, so it
+// never reaches PluginAuditManager's audit_hook -- there is no filesystem path
+// or network target for it to key permission on. Mutating live print settings
+// needs its own gate, so this shows the same Yes/No prompt style the audit
+// manager uses for fs/network permissions before touching anything.
+//
+// Values are extracted from the Python dict, and the calling plugin's identity
+// resolved, on the calling thread -- run_on_ui_blocking's callable must not
+// touch Python objects, since it may run with the GIL not held (see
+// PluginBindingUtils.hpp). current_plugin() is thread_local; a plugin thread
+// spawned with threading.Thread still resolves to the right name because
+// PythonInterpreter::install_thread_audit_propagation() re-opens the spawning
+// callback's audit identity on that thread for the lifetime of its run().
+// Only a plugin bypassing threading.Thread entirely (e.g. ctypes-level thread
+// creation) would fall back to the generic "A plugin" below.
+std::vector<std::string> apply_config(const py::dict& values)
+{
+    std::vector<std::pair<std::string, std::string>> pending;
+    pending.reserve(values.size());
+    for (auto item : values)
+        pending.emplace_back(py::str(item.first).cast<std::string>(), py::str(item.second).cast<std::string>());
+
+    std::string plugin_name = "A plugin";
+    const std::string plugin_key = PluginAuditManager::instance().current_plugin();
+    if (!plugin_key.empty()) {
+        PluginDescriptor descriptor;
+        if (PluginManager::instance().try_get_plugin_descriptor(plugin_key, descriptor) && !descriptor.name.empty())
+            plugin_name = descriptor.name;
+    }
+
+    return run_on_ui_blocking([pending = std::move(pending), plugin_name]() -> std::vector<std::string> {
+        if (pending.empty())
+            return {};
+
+        wxString change_list;
+        for (const auto& [key, value] : pending)
+            change_list += wxString::FromUTF8(key.c_str()) + " = " + wxString::FromUTF8(value.c_str()) + "\n";
+
+        wxMessageDialog dialog(nullptr,
+                               wxString::Format(_L("Plugin \"%s\" wants to change the following setting(s):\n\n%s"),
+                                                 wxString::FromUTF8(plugin_name.c_str()), change_list),
+                               _L("Plugin settings change"), wxYES_NO | wxICON_WARNING);
+        if (dialog.ShowModal() != wxID_YES)
+            throw std::runtime_error("apply_config: user declined the requested settings change");
+
+        DynamicPrintConfig config;
+        std::vector<std::string> applied;
+        for (const auto& [key, value] : pending) {
+            try {
+                config.set_deserialize_strict(key, value);
+            } catch (const std::exception& ex) {
+                throw std::runtime_error("apply_config: failed to set '" + key + "' = '" + value + "': " + ex.what());
+            }
+            applied.push_back(key);
+        }
+        GUI::wxGetApp().mainframe->load_config(config);
+        return applied;
+    });
 }
 
 } // namespace
@@ -132,7 +209,18 @@ void host_bindings::register_presets(py::module_& host)
         })
         .def("full_config_value", [](const PresetBundle& bundle, const std::string& key) {
             return config_value_or_none(bundle.full_config(), key);
-        });
+        })
+        .def(
+            "apply_config",
+            [](PresetBundle&, const py::dict& values) { return apply_config(values); },
+            py::arg("values"),
+            "Apply a {config_key: value_string} diff to the active print/filament/printer "
+            "presets and refresh the GUI, the same way loading a config file does. Prompts the "
+            "user with a Yes/No summary of the change first; declining raises. Values are "
+            "parsed the same way a config file's key=value lines are; an unknown key or a value "
+            "that fails to parse raises and nothing is applied. Runs on the UI thread "
+            "(marshaled automatically) and marks the affected presets dirty -- it does not save "
+            "them.");
 }
 
 } // namespace Slic3r
