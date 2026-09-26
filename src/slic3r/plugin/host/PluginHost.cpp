@@ -4,9 +4,41 @@
 #include <slic3r/plugin/PluginAuditManager.hpp>
 #include <slic3r/plugin/PluginManager.hpp>
 
+#include <pybind11/stl.h>
+
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace Slic3r {
+
+namespace {
+
+// Re-opens a captured (plugin_key, capability_name) pair as a ScopedPluginAuditContext, usable
+// as a Python context manager. Backs the threading.Thread propagation installed by
+// PythonInterpreter (see install_thread_audit_propagation there): a thread a plugin spawns via
+// threading.Thread runs on its own OS thread, which starts with an empty thread_local audit
+// identity, so without this the audit hook and identity-reading host APIs (e.g.
+// PresetBundle.apply_config) would treat code running on it as not coming from any plugin at
+// all. Internal -- the leading underscore says this isn't part of the plugin-facing API.
+class AuditScope
+{
+public:
+    AuditScope(std::string plugin_key, std::string capability_name)
+        : m_plugin_key(std::move(plugin_key)), m_capability_name(std::move(capability_name))
+    {}
+
+    void enter() { m_scope.emplace(m_plugin_key, m_capability_name); }
+    void exit(const pybind11::object&, const pybind11::object&, const pybind11::object&) { m_scope.reset(); }
+
+private:
+    std::string                             m_plugin_key;
+    std::string                             m_capability_name;
+    std::optional<ScopedPluginAuditContext> m_scope;
+};
+
+} // namespace
 
 namespace host_bindings {
 void register_plugin(pybind11::module_& host)
@@ -23,6 +55,21 @@ void register_plugin(pybind11::module_& host)
             return PluginManager::instance().get_storage_dir(plugin_key);
         },
         "Return the installed folder of the current plugin.");
+
+    pybind11::class_<AuditScope>(plugin_host, "_AuditScope",
+                                 "Internal: re-opens a captured plugin audit identity as a context "
+                                 "manager. Not part of the plugin-facing API.")
+        .def(pybind11::init<std::string, std::string>())
+        .def("__enter__", &AuditScope::enter)
+        .def("__exit__", &AuditScope::exit);
+
+    plugin_host.def(
+        "_capture_audit_identity",
+        []() -> std::pair<std::string, std::string> {
+            return {PluginAuditManager::instance().current_plugin(), PluginAuditManager::instance().current_capability()};
+        },
+        "Internal: the calling thread's current (plugin_key, capability_name), or (\"\", \"\") "
+        "outside a plugin callback. Not part of the plugin-facing API.");
 }
 } // namespace host_bindings
 

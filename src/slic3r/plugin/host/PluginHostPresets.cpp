@@ -58,10 +58,12 @@ PresetCollection& printer_presets(PresetBundle& bundle)
 // Values are extracted from the Python dict, and the calling plugin's identity
 // resolved, on the calling thread -- run_on_ui_blocking's callable must not
 // touch Python objects, since it may run with the GIL not held (see
-// PluginBindingUtils.hpp). Note current_plugin() is thread_local and only set
-// while the host is calling into the plugin directly: a plugin that calls this
-// from its own background thread (e.g. threading.Thread) will show up as "A
-// plugin" below rather than by name.
+// PluginBindingUtils.hpp). current_plugin() is thread_local; a plugin thread
+// spawned with threading.Thread still resolves to the right name because
+// PythonInterpreter::install_thread_audit_propagation() re-opens the spawning
+// callback's audit identity on that thread for the lifetime of its run().
+// Only a plugin bypassing threading.Thread entirely (e.g. ctypes-level thread
+// creation) would fall back to the generic "A plugin" below.
 std::vector<std::string> apply_config(const py::dict& values)
 {
     std::vector<std::pair<std::string, std::string>> pending;

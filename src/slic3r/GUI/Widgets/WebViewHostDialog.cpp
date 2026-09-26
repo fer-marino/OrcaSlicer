@@ -170,6 +170,11 @@ bool WebViewHostDialog::create_webview(const std::string& resource_path,
         return false;
     }
 
+    // Same opt-in gate PrinterWebView.cpp uses: DevTools (right-click Inspect / F12) are
+    // off for ordinary users, but a developer_mode session can debug a plugin's own HTML/JS
+    // the same way it can debug the printer web UI.
+    m_browser->EnableAccessToDevTools(wxGetApp().app_config->get_bool("developer_mode"));
+
     SetSizer(topsizer);
     topsizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
 
